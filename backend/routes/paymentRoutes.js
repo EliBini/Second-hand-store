@@ -8,7 +8,7 @@ const connectToDatabase = require('../models/db');
 const logger = require('../logger');
 const { authenticate } = require('../middleware/auth');
 const { ObjectId } = require('mongodb');
-const axios = require('axios');
+// No external PayPal calls: use simulated sandbox flow
 
 // Note: Pay-with-balance endpoint removed in favor of PayPal Sandbox integration.
 
@@ -46,72 +46,10 @@ router.post('/create-order', authenticate, async (req, res, next) => {
             return res.status(400).json({ error: 'Cannot buy your own item' });
         }
 
-        // If PayPal credentials exist, create PayPal order in Sandbox
-        const clientId = process.env.PAYPAL_CLIENT_ID;
-        const clientSecret = process.env.PAYPAL_SECRET;
-
-        if (!clientId || !clientSecret) {
-            // Fallback: create a pending local order (simulated)
-            const payment = {
-                orderId: `ORDER-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-                itemId,
-                buyerId: req.user.id,
-                sellerId: item.ownerId,
-                amount,
-                status: 'pending', // pending, completed, cancelled
-                createdAt: new Date(),
-                updatedAt: new Date(),
-            };
-
-            await paymentsCollection.insertOne(payment);
-
-            logger.info(`Payment order created (sim): ${payment.orderId} for item ${itemId}`);
-
-            return res.json({ orderId: payment.orderId, amount: payment.amount });
-        }
-
-        // Get PayPal access token
-        const tokenResp = await axios({
-            method: 'post',
-            url: 'https://api-m.sandbox.paypal.com/v1/oauth2/token',
-            auth: {
-                username: clientId,
-                password: clientSecret,
-            },
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            data: 'grant_type=client_credentials',
-        });
-
-        const accessToken = tokenResp.data.access_token;
-
-        // Create PayPal order
-        const orderResp = await axios({
-            method: 'post',
-            url: 'https://api-m.sandbox.paypal.com/v2/checkout/orders',
-            headers: {
-                Authorization: `Bearer ${accessToken}`,
-                'Content-Type': 'application/json',
-            },
-            data: {
-                intent: 'CAPTURE',
-                purchase_units: [
-                    {
-                        amount: {
-                            currency_code: 'USD',
-                            value: amount.toString(),
-                        },
-                        reference_id: itemId,
-                    },
-                ],
-            },
-        });
-
-        const paypalOrderId = orderResp.data.id;
-
-        // create local pending payment record referencing PayPal order
+        // Always use a simulated PayPal sandbox order (no external API calls)
         const payment = {
-            orderId: paypalOrderId,
-            provider: 'paypal',
+            orderId: `SANDBOX-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+            provider: 'paypal-sandbox',
             itemId,
             buyerId: req.user.id,
             sellerId: item.ownerId,
@@ -123,9 +61,9 @@ router.post('/create-order', authenticate, async (req, res, next) => {
 
         await paymentsCollection.insertOne(payment);
 
-        logger.info(`PayPal order created: ${paypalOrderId} for item ${itemId}`);
+        logger.info(`Sandbox payment order created: ${payment.orderId} for item ${itemId}`);
 
-        res.json({ orderId: paypalOrderId, amount: payment.amount, provider: 'paypal' });
+        res.json({ orderId: payment.orderId, amount: payment.amount, provider: payment.provider });
     } catch (error) {
         logger.error('Error creating payment order:', error);
         next(error);
@@ -135,7 +73,9 @@ router.post('/create-order', authenticate, async (req, res, next) => {
 // אישור תשלום (סימולציה של PayPal)
 router.post('/capture-order', authenticate, async (req, res, next) => {
     try {
-        const { orderId } = req.body;
+        // accept either `orderId` or `orderID` (PayPal uses `orderID` in the SDK)
+        const { orderId: orderIdBody, orderID: orderIDBody } = req.body || {};
+        const orderId = orderIdBody || orderIDBody;
 
         if (!orderId) {
             return res.status(400).json({ error: 'Missing orderId' });
@@ -156,60 +96,14 @@ router.post('/capture-order', authenticate, async (req, res, next) => {
             return res.status(403).json({ error: 'Unauthorized' });
         }
 
-        if (payment.provider === 'paypal') {
-            const clientId = process.env.PAYPAL_CLIENT_ID;
-            const clientSecret = process.env.PAYPAL_SECRET;
-
-            if (!clientId || !clientSecret) {
-                return res.status(500).json({ error: 'PayPal credentials not configured' });
-            }
-
-            // get access token
-            const tokenResp = await axios({
-                method: 'post',
-                url: 'https://api-m.sandbox.paypal.com/v1/oauth2/token',
-                auth: { username: clientId, password: clientSecret },
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                data: 'grant_type=client_credentials',
-            });
-
-            const accessToken = tokenResp.data.access_token;
-
-            // capture the order
-            const capResp = await axios({
-                method: 'post',
-                url: `https://api-m.sandbox.paypal.com/v2/checkout/orders/${orderId}/capture`,
-                headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-            });
-
-            // Update local payment record
-            await paymentsCollection.updateOne(
-                { orderId },
-                {
-                    $set: {
-                        status: 'completed',
-                        completedAt: new Date(),
-                        updatedAt: new Date(),
-                        providerResponse: capResp.data,
-                    },
-                }
-            );
-
-            // mark item sold
-            await itemsCollection.updateOne(
-                { id: payment.itemId },
-                { $set: { status: 'sold', soldTo: payment.buyerId, soldAt: new Date() } }
-            );
-
-            logger.info(`PayPal payment captured: ${orderId} for item ${payment.itemId}`);
-
-            return res.json({ success: true, orderId, status: 'completed', providerResponse: capResp.data });
-        }
+        // Simulated capture flow for sandbox payments
+        // Update payment status to completed and mark item as paid/sold
 
         // Fallback: local simulated capture
         if (payment.status !== 'pending') {
             return res.status(400).json({ error: `Order already ${payment.status}` });
         }
+
 
         await paymentsCollection.updateOne(
             { orderId },
@@ -218,6 +112,7 @@ router.post('/capture-order', authenticate, async (req, res, next) => {
                     status: 'completed',
                     completedAt: new Date(),
                     updatedAt: new Date(),
+                    providerResponse: { simulated: true },
                 },
             }
         );
@@ -229,6 +124,7 @@ router.post('/capture-order', authenticate, async (req, res, next) => {
                     status: 'sold',
                     soldTo: payment.buyerId,
                     soldAt: new Date(),
+                    isPaid: true,
                 },
             }
         );
@@ -327,8 +223,6 @@ router.get('/my-sales', authenticate, async (req, res, next) => {
     }
 });
 
-// קבלת היתרה של המשתמש (balance)
-// Balance endpoint removed.
 
 module.exports = router;
 
